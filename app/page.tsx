@@ -1,11 +1,22 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Chatbot, { type ChatMessage } from "@/app/components/Chatbot";
 import DishItem from "@/app/components/DishItem";
 import Navbar from "@/app/components/Navbar";
 import Footer from "@/app/components/Footer";
 import RestaurantList, { type MenuItem, type Restaurant } from "@/app/components/RestaurantList";
+import { useAuth } from "@/app/context/AuthContext";
+import {
+  createOrder,
+  getCart,
+  getUserProfile,
+  saveCart,
+  clearCart,
+  saveChatMessage,
+  getChatHistory,
+  type CartItemDoc,
+} from "@/lib/firestore";
 
 type Recommendation = {
   title: string;
@@ -162,7 +173,9 @@ function detectAllergies(message: string) {
 }
 
 export default function Home() {
-  const [userId] = useState("guest-user");
+  const { user } = useAuth();
+  const userId = user?.uid ?? "guest-user";
+
   const [diet, setDiet] = useState("Balanced");
   const [allergies, setAllergies] = useState("None");
   const [pantry, setPantry] = useState("Yogurt, chickpeas, greens");
@@ -183,6 +196,83 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [response, setResponse] = useState<ApiResponse | null>(null);
+  const [cartLoaded, setCartLoaded] = useState(false);
+
+  // Debounce timer for cart persistence
+  const cartSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Load user profile + cart from Firestore on login
+  useEffect(() => {
+    if (!user) {
+      setCartLoaded(true);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadUserData() {
+      try {
+        const [profile, savedCart, history] = await Promise.all([
+          getUserProfile(user!.uid),
+          getCart(user!.uid),
+          getChatHistory(user!.uid),
+        ]);
+
+        if (cancelled) return;
+
+        if (profile) {
+          if (profile.diet) setDiet(profile.diet);
+          if (profile.allergies) setAllergies(profile.allergies);
+          if (profile.deliveryArea) setLocationLabel(profile.deliveryArea);
+        }
+
+        if (savedCart.length > 0) {
+          setCartItems(
+            savedCart.map((item: CartItemDoc) => ({
+              id: item.id,
+              name: item.name,
+              price: item.price,
+              restaurantName: item.restaurantName,
+              quantity: item.quantity,
+            }))
+          );
+        }
+
+        if (history.length > 0) {
+          setChatMessages(
+            history.map((msg) => ({ role: msg.role, text: msg.text }))
+          );
+        }
+      } catch {
+        // Non-blocking — use defaults
+      } finally {
+        if (!cancelled) setCartLoaded(true);
+      }
+    }
+
+    loadUserData();
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
+
+  // Persist cart to Firestore (debounced) when logged in
+  const persistCart = useCallback(
+    (items: CartItem[]) => {
+      if (!user || !cartLoaded) return;
+
+      if (cartSaveTimer.current) {
+        clearTimeout(cartSaveTimer.current);
+      }
+
+      cartSaveTimer.current = setTimeout(() => {
+        saveCart(user.uid, items).catch(() => {
+          // Non-blocking
+        });
+      }, 800);
+    },
+    [user, cartLoaded]
+  );
 
   function slugify(value: string) {
     return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
@@ -203,22 +293,25 @@ export default function Home() {
     setResponse(null);
     setCartItems((current) => {
       const existing = current.find((entry) => entry.id === item.id);
+      let next: CartItem[];
       if (existing) {
-        return current.map((entry) =>
+        next = current.map((entry) =>
           entry.id === item.id ? { ...entry, quantity: entry.quantity + 1 } : entry
         );
+      } else {
+        next = [
+          ...current,
+          {
+            id: item.id,
+            name: item.name,
+            price: item.price,
+            restaurantName: restaurant.name,
+            quantity: 1,
+          },
+        ];
       }
-
-      return [
-        ...current,
-        {
-          id: item.id,
-          name: item.name,
-          price: item.price,
-          restaurantName: restaurant.name,
-          quantity: 1,
-        },
-      ];
+      persistCart(next);
+      return next;
     });
   }
 
@@ -226,13 +319,16 @@ export default function Home() {
     setCheckoutStatus(null);
     setResponse(null);
     setCartItems((current) => {
+      let next: CartItem[];
       if (nextQuantity <= 0) {
-        return current.filter((item) => item.id !== itemId);
+        next = current.filter((item) => item.id !== itemId);
+      } else {
+        next = current.map((item) =>
+          item.id === itemId ? { ...item, quantity: nextQuantity } : item
+        );
       }
-
-      return current.map((item) =>
-        item.id === itemId ? { ...item, quantity: nextQuantity } : item
-      );
+      persistCart(next);
+      return next;
     });
   }
 
@@ -244,6 +340,11 @@ export default function Home() {
 
     setChatMessages((current) => [...current, { role: "user", text: trimmed }]);
     setChatDraft("");
+
+    // Persist user message to Firestore (non-blocking)
+    if (user) {
+      saveChatMessage(user.uid, "user", trimmed).catch(() => {});
+    }
 
     setChatLoading(true);
     try {
@@ -278,19 +379,28 @@ export default function Home() {
         setPantry(pantryMatch[1].trim());
       }
 
-      setChatMessages((current) => [...current, { role: "assistant", text: data.reply }]);
+      const reply = data.reply;
+      setChatMessages((current) => [...current, { role: "assistant", text: reply }]);
+
+      // Persist assistant reply to Firestore (non-blocking)
+      if (user) {
+        saveChatMessage(user.uid, "assistant", reply).catch(() => {});
+      }
     } catch {
       const nextDiet = detectDiet(trimmed);
       const nextAllergies = detectAllergies(trimmed);
       setDiet(nextDiet);
       setAllergies(nextAllergies);
+      const fallbackReply = `Saved. Diet: ${nextDiet}. Allergies: ${nextAllergies}. Add items to cart and tap Smart Recommend in cart for suggestions.`;
       setChatMessages((current) => [
         ...current,
-        {
-          role: "assistant",
-          text: `Saved. Diet: ${nextDiet}. Allergies: ${nextAllergies}. Add items to cart and tap Smart Recommend in cart for suggestions.`,
-        },
+        { role: "assistant", text: fallbackReply },
       ]);
+
+      // Persist fallback reply too
+      if (user) {
+        saveChatMessage(user.uid, "assistant", fallbackReply).catch(() => {});
+      }
     } finally {
       setChatLoading(false);
     }
@@ -310,22 +420,25 @@ export default function Home() {
 
     setCartItems((current) => {
       const existing = current.find((item) => item.id === id);
+      let next: CartItem[];
       if (existing) {
-        return current.map((item) =>
+        next = current.map((item) =>
           item.id === id ? { ...item, quantity: item.quantity + 1 } : item
         );
+      } else {
+        next = [
+          ...current,
+          {
+            id,
+            name: itemName,
+            price,
+            restaurantName: "NutriCraver Smart Add-on",
+            quantity: 1,
+          },
+        ];
       }
-
-      return [
-        ...current,
-        {
-          id,
-          name: itemName,
-          price,
-          restaurantName: "NutriCraver Smart Add-on",
-          quantity: 1,
-        },
-      ];
+      persistCart(next);
+      return next;
     });
 
     if (source === "swap") {
@@ -333,13 +446,33 @@ export default function Home() {
     }
   }
 
-  function handleCheckout() {
+  async function handleCheckout() {
     if (cartItems.length === 0) {
       setError("Add items to cart before checkout.");
       return;
     }
 
     const checkoutId = `NC-${Math.floor(100000 + Math.random() * 900000)}`;
+
+    // Save order to Firestore if logged in
+    if (user) {
+      try {
+        await createOrder(user.uid, {
+          items: cartItems.map((item) => ({
+            name: item.name,
+            price: item.price,
+            quantity: item.quantity,
+            restaurantName: item.restaurantName,
+          })),
+          total: cartTotal,
+          trackingId: checkoutId,
+        });
+        await clearCart(user.uid);
+      } catch {
+        // Non-blocking — order still proceeds locally
+      }
+    }
+
     setCheckoutStatus(`Proceeding to provenance... Order placed. Tracking ID: ${checkoutId}`);
     setCartItems([]);
     setResponse(null);

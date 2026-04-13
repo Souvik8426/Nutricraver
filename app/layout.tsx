@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Inter, Noto_Serif } from "next/font/google";
 import "./globals.css";
+import Providers from "./Providers";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -35,8 +36,8 @@ export default function RootLayout({
           href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@300,0..1&display=swap"
         />
       </head>
-      <body className="min-h-screen flex flex-col font-body bg-surface text-on-surface selection:bg-secondary-fixed selection:text-on-secondary-fixed">
-        {children}
+      <body suppressHydrationWarning className="min-h-screen flex flex-col font-body bg-surface text-on-surface selection:bg-secondary-fixed selection:text-on-secondary-fixed">
+        <Providers>{children}</Providers>
       </body>
     </html>
   );
